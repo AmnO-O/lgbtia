@@ -5,6 +5,7 @@ import os
 import re
 import glob
 import unicodedata
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
@@ -51,7 +52,9 @@ def load_dataset_files(data_paths: Optional[List[str]] = None) -> pd.DataFrame:
         found = []
         for pat in search_patterns:
             found.extend(glob.glob(pat, recursive=True))
-        data_paths = sorted(list(set(found)))
+        # Deduplicate paths using resolved absolute paths
+        unique_paths = {str(Path(p).resolve()): p for p in found}
+        data_paths = sorted(list(unique_paths.values()))
 
     if not data_paths:
         raise FileNotFoundError(
@@ -89,7 +92,14 @@ def preprocess_task_b_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Map hate speech labels: 0: no, 1: yes_implicit, 2: yes_explicit
     if 'hate_speech' in df.columns:
-        df['label'] = df['hate_speech'].str.strip().str.lower().map(HATE2IDX).fillna(0).astype(np.int64)
+        mapped = df['hate_speech'].str.strip().str.lower().map(HATE2IDX)
+        unmapped = mapped.isna()
+        if unmapped.any():
+            bad_labels = df.loc[unmapped, 'hate_speech'].unique().tolist()
+            print(f"⚠️ Warning: {unmapped.sum()} rows have unknown hate_speech labels: {bad_labels}. Dropping them.")
+            df = df[~unmapped].copy()
+            mapped = mapped[~unmapped]
+        df['label'] = mapped.astype(np.int64)
 
     return df
 

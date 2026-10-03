@@ -26,7 +26,7 @@ class HateSpeechPredictor:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Loading checkpoint from: {checkpoint_path} on {self.device}...")
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model_cfg: ModelConfig = checkpoint.get('model_config', ModelConfig())
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_cfg.model_name_or_path)
@@ -36,6 +36,7 @@ class HateSpeechPredictor:
             num_query_slots=self.model_cfg.num_query_slots,
             split_layer_idx=self.model_cfg.split_layer_idx,
             transplant_layers_count=self.model_cfg.transplant_layers_count,
+            context_mode=self.model_cfg.context_mode,
             use_prenorm=self.model_cfg.use_prenorm,
             use_ffn=self.model_cfg.use_ffn_transplant,
             freeze_encoder=False,

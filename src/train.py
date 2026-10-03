@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import pandas as pd
 import numpy as np
+import random
 from sklearn.utils.class_weight import compute_class_weight
 
 from src.config import ModelConfig, TrainingConfig
@@ -78,6 +79,7 @@ def evaluate_epoch(
     model.eval()
     val_loss_sum = 0.0
     all_preds = []
+    all_labels = []
 
     for batch in val_loader:
         input_ids = batch['input_ids'].to(device)
@@ -90,11 +92,13 @@ def evaluate_epoch(
 
         preds = torch.argmax(compound_probs, dim=-1).cpu().numpy().flatten()
         all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy().flatten())
 
     all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
     val_loss = val_loss_sum / max(1, len(val_loader))
 
-    metrics = compute_task_b_metrics(val_df['label'].values, all_preds)
+    metrics = compute_task_b_metrics(all_labels, all_preds)
     metrics['val_loss'] = val_loss
 
     breakdown_df = evaluate_task_b_by_language(val_df, all_preds)
@@ -113,6 +117,13 @@ def train_task_b_model(
     os.makedirs(train_cfg.output_dir, exist_ok=True)
     device = torch.device(train_cfg.device)
     print(f"=== Task B: K-Latent Transplant mmBERT (K={model_cfg.num_query_slots}) on {device} ===")
+
+    # Set all random seeds for reproducibility
+    random.seed(train_cfg.seed)
+    np.random.seed(train_cfg.seed)
+    torch.manual_seed(train_cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(train_cfg.seed)
 
     # 1. Load Data
     if df_raw is None:
@@ -149,13 +160,15 @@ def train_task_b_model(
         train_dataset,
         batch_size=train_cfg.batch_size,
         shuffle=True,
-        num_workers=0
+        num_workers=train_cfg.num_workers,
+        pin_memory=(train_cfg.device == 'cuda')
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_cfg.batch_size * 2,
         shuffle=False,
-        num_workers=0
+        num_workers=train_cfg.num_workers,
+        pin_memory=(train_cfg.device == 'cuda')
     )
 
     # 4. Model & Loss
@@ -222,12 +235,12 @@ def train_task_b_model(
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                     print(f"⚠️ Warning: NaN/Inf gradient norm encountered at step {step}. Skipping optimizer update.")
                     optimizer.zero_grad()
-                    scaler.update()
                 else:
                     scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
                     scheduler.step()
+                scaler.update()
+                if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                    optimizer.zero_grad()
 
             train_loss += loss.item() * train_cfg.gradient_accumulation_steps
             valid_steps += 1
@@ -273,25 +286,62 @@ def train_task_b_model(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Task B with K-Latent Pretrained Weight Borrowing")
+    parser.add_argument("--model_name", type=str, default="jhu-clsp/mmbert-base")
     parser.add_argument("--num_query_slots", type=int, default=8, help="Number of latent query slots K")
+    parser.add_argument("--probe_init_std", type=float, default=0.02)
+    parser.add_argument("--split_layer_idx", type=int, default=17)
+    parser.add_argument("--transplant_layers_count", type=int, default=5)
+    parser.add_argument("--context_mode", type=str, choices=["layer_matched", "static_h17"], default="layer_matched")
     parser.add_argument("--use_prenorm", action="store_true", help="Experiment B: Pre-Normalized Borrowing")
     parser.add_argument("--use_ffn", action="store_true", help="Ablation 4: Include transplanted FFN")
+    parser.add_argument("--unfreeze_encoder", action="store_true")
+    parser.add_argument("--unfreeze_transplant", action="store_true")
+    parser.add_argument("--dropout", type=float, default=0.1)
+
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--encoder_lr", type=float, default=1e-5)
+    parser.add_argument("--transplant_lr", type=float, default=3e-5)
     parser.add_argument("--head_lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--max_length", type=int, default=384)
+    parser.add_argument("--val_size", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--output_dir", type=str, default="./outputs_task_b")
     args = parser.parse_args()
 
     m_cfg = ModelConfig(
+        model_name_or_path=args.model_name,
         num_query_slots=args.num_query_slots,
+        probe_init_std=args.probe_init_std,
+        split_layer_idx=args.split_layer_idx,
+        transplant_layers_count=args.transplant_layers_count,
+        context_mode=args.context_mode,
         use_prenorm=args.use_prenorm,
-        use_ffn_transplant=args.use_ffn
+        use_ffn_transplant=args.use_ffn,
+        freeze_encoder=not args.unfreeze_encoder,
+        freeze_transplant=not args.unfreeze_transplant,
+        dropout=args.dropout
     )
     t_cfg = TrainingConfig(
+        output_dir=args.output_dir,
+        seed=args.seed,
+        val_size=args.val_size,
+        max_length=args.max_length,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         epochs=args.epochs,
+        encoder_lr=args.encoder_lr,
+        transplant_lr=args.transplant_lr,
         head_lr=args.head_lr,
-        output_dir=args.output_dir
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        use_class_weights=not args.no_class_weights,
+        num_workers=args.num_workers
     )
 
     train_task_b_model(m_cfg, t_cfg)

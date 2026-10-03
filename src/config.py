@@ -73,3 +73,4 @@ class TrainingConfig:
     fp16: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     early_stopping_patience: int = 5
+    num_workers: int = 2

@@ -8,7 +8,10 @@ Implements the exact ModernBERT native layer-by-layer forward execution skeleton
 
 import math
 import copy
+import logging
 from typing import Tuple, Optional, Dict, Any, List, Union
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn as nn
@@ -31,7 +34,10 @@ def apply_rotary_pos_emb_single(k: torch.Tensor, cos: torch.Tensor, sin: torch.T
       cos: [B, L, head_dim] (or broadcastable [1, L, head_dim])
       sin: [B, L, head_dim] (or broadcastable [1, L, head_dim])
     """
-    if cos.dim() == 3:
+    if cos.dim() == 4 and cos.shape[1] == k.shape[2] and cos.shape[2] == 1:
+        cos = cos.transpose(1, 2)
+        sin = sin.transpose(1, 2)
+    elif cos.dim() == 3:
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
     elif cos.dim() == 2:
@@ -79,8 +85,8 @@ def build_native_attention_masks(
                 "sliding_attention": sliding_mask,
                 "global_attention": full_mask,
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("HF native mask utilities failed (%s), falling back to manual masks.", e)
 
     # 2. Memory-efficient fallback (broadcasted [B, 1, 1, L] without O(L^2) materialization)
     B, L, _ = inputs_embeds.shape
@@ -158,11 +164,17 @@ class PretrainedCrossAttentionLayer(nn.Module):
         z_in = self.attn_norm(z) if (self.use_prenorm and self.attn_norm is not None) else z
         h_in = self.attn_norm(h_context) if (self.use_prenorm and self.attn_norm is not None) else h_context
 
-        # Project Q from Z, K & V from H
+        # Project Q from Z, K & V from H (preserving pretrained biases)
         q_weight, k_weight, v_weight = self.Wqkv.weight.chunk(3, dim=0)
-        q = F.linear(z_in, q_weight)
-        k = F.linear(h_in, k_weight)
-        v = F.linear(h_in, v_weight)
+        if self.Wqkv.bias is not None:
+            q_bias, k_bias, v_bias = self.Wqkv.bias.chunk(3, dim=0)
+            q = F.linear(z_in, q_weight, q_bias)
+            k = F.linear(h_in, k_weight, k_bias)
+            v = F.linear(h_in, v_weight, v_bias)
+        else:
+            q = F.linear(z_in, q_weight)
+            k = F.linear(h_in, k_weight)
+            v = F.linear(h_in, v_weight)
 
         q = q.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -410,8 +422,9 @@ class TransplantedKLatentModel(nn.Module):
                 else:
                     layer_out = layer(hidden_states, attention_mask=cur_mask)
                 hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-            except Exception:
+            except Exception as e:
                 # Fallback to standard forward if signature differs
+                logger.debug("Layer %d native forward failed (%s), using fallback.", i, e)
                 layer_out = layer(hidden_states, attention_mask=cur_mask)
                 hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
@@ -445,6 +458,13 @@ class TransplantedKLatentModel(nn.Module):
 
         # 2. Query Stream: Expand Z_0 to batch dimension [B, K, D]
         z = self.query_probes.unsqueeze(0).expand(B, -1, -1)
+
+        # Safety: verify enough hidden states for layer_matched mode
+        if self.context_mode == "layer_matched":
+            required = self.split_layer_idx + self.transplant_layers_count
+            assert len(saved_hidden_states) >= required, (
+                f"layer_matched mode requires {required} hidden states, got {len(saved_hidden_states)}"
+            )
 
         # 3. Pass through Transplanted Cross-Attention Stack (Layers 18 to 22)
         for i, transplant_layer in enumerate(self.transplant_layers):

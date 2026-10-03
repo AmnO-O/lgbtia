@@ -37,7 +37,8 @@ class HierarchicalCompoundLoss(nn.Module):
         super().__init__()
 
         if class_weights is None:
-            self.register_buffer("class_weights", None)
+            self.register_buffer("class_weights", torch.ones(3, dtype=torch.float32))
+            self.has_custom_weights = False
         else:
             weights = torch.as_tensor(
                 class_weights,
@@ -58,6 +59,7 @@ class HierarchicalCompoundLoss(nn.Module):
                 "class_weights",
                 weights
             )
+            self.has_custom_weights = True
 
     def forward(
         self,
@@ -109,7 +111,7 @@ class HierarchicalCompoundLoss(nn.Module):
         loss = F.nll_loss(
             log_probs,
             targets,
-            weight=self.class_weights,
+            weight=self.class_weights if self.has_custom_weights else None,
             reduction="mean"
         )
 
