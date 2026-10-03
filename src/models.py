@@ -86,7 +86,8 @@ def build_native_attention_masks(
     B, L, _ = inputs_embeds.shape
     device = inputs_embeds.device
     dtype = inputs_embeds.dtype
-    min_val = torch.finfo(dtype).min if dtype.is_floating_point else -10000.0
+    # Safe masking constant for fp16 / fp32 stability (avoid -65504.0 float16 min underflow)
+    min_val = -10000.0
     window_size = sliding_window or getattr(config, "local_attention", 128)
 
     if attention_mask is not None:
@@ -186,7 +187,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
                 mask_4d = context_mask.to(scores.dtype)
             scores = scores + mask_4d
 
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores.float(), dim=-1).to(v.dtype)
         attn_out = torch.matmul(attn_weights, v)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
 
@@ -248,7 +249,7 @@ class HierarchicalTreeHead(nn.Module):
         v = self.val_proj(z_latents)
 
         attn_scores = torch.bmm(q, k.transpose(1, 2)) * (D ** -0.5)
-        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = F.softmax(attn_scores.float(), dim=-1).to(v.dtype)
         readout = torch.bmm(attn_probs, v).squeeze(1)
         return readout
 

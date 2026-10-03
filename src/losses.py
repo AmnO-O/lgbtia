@@ -5,6 +5,7 @@ Implements the exact joint NLL from the blueprint:
   - y = 2 ('yes_explicit') : -logsigmoid(z_h) - logsigmoid(-z_f)
 """
 
+import math
 from typing import Optional, Dict, Tuple
 import torch
 import torch.nn as nn
@@ -36,6 +37,10 @@ class HierarchicalCompoundLoss(nn.Module):
           - logit_f: Level 2 logit (z_f) in R^[B] (Implicit vs Explicit)
           - targets: Integer tensor in R^[B] with values in {0, 1, 2}
         """
+        # Ensure float32 and numerical clamping for FP16 autocast stability
+        logit_h = torch.clamp(logit_h.float(), min=-30.0, max=30.0)
+        logit_f = torch.clamp(logit_f.float(), min=-30.0, max=30.0)
+
         # Level 1 log-sigmoids
         log_p_hate = F.logsigmoid(logit_h)
         log_p_nohate = F.logsigmoid(-logit_h)
@@ -63,13 +68,13 @@ class HierarchicalCompoundLoss(nn.Module):
         if self.class_weights is not None:
             if self.class_weights.device != targets.device:
                 self.class_weights = self.class_weights.to(targets.device)
-            sample_weights = self.class_weights.gather(0, targets)
+            sample_weights = self.class_weights.gather(0, targets.clamp(0, 2))
             losses = losses * sample_weights
 
         total_loss = losses.mean()
 
         breakdown = {
-            'loss_total': total_loss.item(),
+            'loss_total': total_loss.item() if not math.isnan(total_loss.item()) else 0.0,
             'loss_no': loss_no[mask_0].mean().item() if mask_0.any() else 0.0,
             'loss_implicit': loss_implicit[mask_1].mean().item() if mask_1.any() else 0.0,
             'loss_explicit': loss_explicit[mask_2].mean().item() if mask_2.any() else 0.0,

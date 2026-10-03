@@ -198,6 +198,7 @@ def train_task_b_model(
         t0 = time.time()
         model.train()
         train_loss = 0.0
+        valid_steps = 0
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_loader):
@@ -210,6 +211,10 @@ def train_task_b_model(
                 loss, _ = loss_fn(logit_h, logit_f, labels)
                 loss = loss / train_cfg.gradient_accumulation_steps
 
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️ Warning: NaN/Inf loss encountered at step {step}. Skipping step.")
+                continue
+
             scaler.scale(loss).backward()
 
             if (step + 1) % train_cfg.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
@@ -221,8 +226,9 @@ def train_task_b_model(
                 scheduler.step()
 
             train_loss += loss.item() * train_cfg.gradient_accumulation_steps
+            valid_steps += 1
 
-        train_loss /= len(train_loader)
+        train_loss = train_loss / max(1, valid_steps)
 
         # Validation
         val_metrics, breakdown_df = evaluate_epoch(model, val_loader, val_df, loss_fn, device)
