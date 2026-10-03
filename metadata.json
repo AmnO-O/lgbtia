@@ -1,0 +1,8 @@
+{
+  "name": "StereoQueerEval Task B NLP Hub",
+  "description": "Multilingual Hate Speech Classification (Task B) model workspace and testing interface for StereoQueerEval.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
