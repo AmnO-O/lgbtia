@@ -1,11 +1,26 @@
-"""Compound Log-Sigmoid Hierarchical Tree Loss for Task B.
-Implements the exact joint NLL from the blueprint:
-  - y = 0 ('no')           : -logsigmoid(-z_h)
-  - y = 1 ('yes_implicit') : -logsigmoid(z_h) - logsigmoid(z_f)
-  - y = 2 ('yes_explicit') : -logsigmoid(z_h) - logsigmoid(-z_f)
+"""Exact hierarchical 3-class negative log-likelihood for Task B.
+
+Tree:
+    root
+    ├── no-hate
+    └── hate
+        ├── implicit
+        └── explicit
+
+Given:
+    logit_h = hate vs no-hate
+    logit_f = implicit vs explicit | hate
+
+The induced class probabilities are:
+    P(no)       = sigmoid(-logit_h)
+    P(implicit) = sigmoid(logit_h) * sigmoid(logit_f)
+    P(explicit) = sigmoid(logit_h) * sigmoid(-logit_f)
+
+Sum constraint:
+    P(no) + P(implicit) + P(explicit) == 1.0 identically.
+    logsumexp(log_p_no, log_p_implicit, log_p_explicit) == 0.0.
 """
 
-import math
 from typing import Optional, Dict, Tuple
 import torch
 import torch.nn as nn
@@ -13,18 +28,36 @@ import torch.nn.functional as F
 
 
 class HierarchicalCompoundLoss(nn.Module):
-    """Numerically stable compound log-sigmoid loss for 2-level decision tree."""
+    """Exact hierarchical 3-class negative log-likelihood."""
 
     def __init__(
         self,
         class_weights: Optional[torch.Tensor] = None,
-        level1_weight: float = 1.0,
-        level2_weight: float = 1.0
     ):
         super().__init__()
-        self.class_weights = class_weights
-        self.level1_weight = level1_weight
-        self.level2_weight = level2_weight
+
+        if class_weights is None:
+            self.register_buffer("class_weights", None)
+        else:
+            weights = torch.as_tensor(
+                class_weights,
+                dtype=torch.float32
+            )
+
+            if weights.ndim != 1 or weights.numel() != 3:
+                raise ValueError(
+                    "class_weights must have shape [3]."
+                )
+
+            if torch.any(weights <= 0):
+                raise ValueError(
+                    "class_weights must be strictly positive."
+                )
+
+            self.register_buffer(
+                "class_weights",
+                weights
+            )
 
     def forward(
         self,
@@ -32,52 +65,71 @@ class HierarchicalCompoundLoss(nn.Module):
         logit_f: torch.Tensor,
         targets: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Args:
-          - logit_h: Level 1 logit (z_h) in R^[B] (Hate vs Non-Hate)
-          - logit_f: Level 2 logit (z_f) in R^[B] (Implicit vs Explicit)
-          - targets: Integer tensor in R^[B] with values in {0, 1, 2}
-        """
-        # Ensure float32 and numerical clamping for FP16 autocast stability
-        logit_h = torch.clamp(logit_h.float(), min=-30.0, max=30.0)
-        logit_f = torch.clamp(logit_f.float(), min=-30.0, max=30.0)
+        logit_h = logit_h.float().reshape(-1)
+        logit_f = logit_f.float().reshape(-1)
+        targets = targets.long().reshape(-1)
 
-        # Level 1 log-sigmoids
+        if logit_h.shape != logit_f.shape:
+            raise ValueError(
+                "logit_h and logit_f must have identical shape."
+            )
+
+        if targets.shape[0] != logit_h.shape[0]:
+            raise ValueError(
+                "targets and logits must have identical batch size."
+            )
+
+        if torch.any((targets < 0) | (targets > 2)):
+            raise ValueError(
+                "targets must contain only 0, 1, or 2."
+            )
+
+        log_p_no = F.logsigmoid(-logit_h)
         log_p_hate = F.logsigmoid(logit_h)
-        log_p_nohate = F.logsigmoid(-logit_h)
 
-        # Level 2 log-sigmoids
-        log_p_imp = F.logsigmoid(logit_f)
-        log_p_exp = F.logsigmoid(-logit_f)
+        log_p_implicit = (
+            log_p_hate
+            + F.logsigmoid(logit_f)
+        )
 
-        # Compound negative log-likelihoods per class
-        loss_no = -log_p_nohate
-        loss_implicit = - (self.level1_weight * log_p_hate + self.level2_weight * log_p_imp)
-        loss_explicit = - (self.level1_weight * log_p_hate + self.level2_weight * log_p_exp)
+        log_p_explicit = (
+            log_p_hate
+            + F.logsigmoid(-logit_f)
+        )
 
-        # Select per sample
-        losses = torch.zeros_like(logit_h)
-        mask_0 = (targets == 0)
-        mask_1 = (targets == 1)
-        mask_2 = (targets == 2)
+        log_probs = torch.stack(
+            [
+                log_p_no,
+                log_p_implicit,
+                log_p_explicit,
+            ],
+            dim=-1
+        )
 
-        losses[mask_0] = loss_no[mask_0]
-        losses[mask_1] = loss_implicit[mask_1]
-        losses[mask_2] = loss_explicit[mask_2]
+        loss = F.nll_loss(
+            log_probs,
+            targets,
+            weight=self.class_weights,
+            reduction="mean"
+        )
 
-        # Apply class weights if provided
-        if self.class_weights is not None:
-            if self.class_weights.device != targets.device:
-                self.class_weights = self.class_weights.to(targets.device)
-            sample_weights = self.class_weights.gather(0, targets.clamp(0, 2))
-            losses = losses * sample_weights
+        with torch.no_grad():
+            probs = log_probs.exp()
 
-        total_loss = losses.mean()
+            breakdown = {
+                "loss_total": float(loss.detach()),
+                "loss_no": float(
+                    -log_p_no[targets == 0].mean()
+                ) if (targets == 0).any() else 0.0,
+                "loss_implicit": float(
+                    -log_p_implicit[targets == 1].mean()
+                ) if (targets == 1).any() else 0.0,
+                "loss_explicit": float(
+                    -log_p_explicit[targets == 2].mean()
+                ) if (targets == 2).any() else 0.0,
+                "prob_sum_error": float(
+                    (probs.sum(dim=-1) - 1.0).abs().max()
+                ),
+            }
 
-        breakdown = {
-            'loss_total': total_loss.item() if not math.isnan(total_loss.item()) else 0.0,
-            'loss_no': loss_no[mask_0].mean().item() if mask_0.any() else 0.0,
-            'loss_implicit': loss_implicit[mask_1].mean().item() if mask_1.any() else 0.0,
-            'loss_explicit': loss_explicit[mask_2].mean().item() if mask_2.any() else 0.0,
-        }
-
-        return total_loss, breakdown
+        return loss, breakdown

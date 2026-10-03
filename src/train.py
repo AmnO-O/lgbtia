@@ -174,10 +174,8 @@ def train_task_b_model(
     ).to(device)
 
     loss_fn = HierarchicalCompoundLoss(
-        class_weights=class_weights_tensor,
-        level1_weight=train_cfg.level1_loss_weight,
-        level2_weight=train_cfg.level2_loss_weight
-    )
+        class_weights=class_weights_tensor
+    ).to(device)
 
     # Count trainable vs frozen parameters
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -212,18 +210,24 @@ def train_task_b_model(
                 loss = loss / train_cfg.gradient_accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"⚠️ Warning: NaN/Inf loss encountered at step {step}. Skipping step.")
+                print(f"⚠️ Warning: NaN/Inf loss encountered at step {step}. Skipping step and clearing gradients.")
+                optimizer.zero_grad()
                 continue
 
             scaler.scale(loss).backward()
 
             if (step + 1) % train_cfg.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                scheduler.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"⚠️ Warning: NaN/Inf gradient norm encountered at step {step}. Skipping optimizer update.")
+                    optimizer.zero_grad()
+                    scaler.update()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
             train_loss += loss.item() * train_cfg.gradient_accumulation_steps
             valid_steps += 1

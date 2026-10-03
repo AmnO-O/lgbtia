@@ -69,8 +69,6 @@ class TrainingConfig:
     
     # Loss & Class Weighting
     use_class_weights: bool = True
-    level1_loss_weight: float = 1.0
-    level2_loss_weight: float = 1.0
     
     fp16: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
