@@ -19,6 +19,18 @@ The induced class probabilities are:
 Sum constraint:
     P(no) + P(implicit) + P(explicit) == 1.0 identically.
     logsumexp(log_p_no, log_p_implicit, log_p_explicit) == 0.0.
+
+Class Weighting Behavior:
+    When class_weights [w_0, w_1, w_2] are provided, this computes weighted leaf-level NLL:
+        L = sum_i(w_{y_i} * (-log P_{y_i})) / sum_i(w_{y_i})
+
+    For individual examples:
+        L_{no}       = -log sigma(-logit_h)
+        L_{implicit} = -log sigma(logit_h) - log sigma(logit_f)
+        L_{explicit} = -log sigma(logit_h) - log sigma(-logit_f)
+
+    Thus, class weighting controls how strongly each leaf example influences the root
+    node (logit_h) as well as the fine-grained division node (logit_f).
 """
 
 from typing import Optional, Dict, Tuple
@@ -28,7 +40,7 @@ import torch.nn.functional as F
 
 
 class HierarchicalCompoundLoss(nn.Module):
-    """Exact hierarchical 3-class negative log-likelihood."""
+    """Exact hierarchical 3-class negative log-likelihood with leaf-level class weighting."""
 
     def __init__(
         self,
@@ -118,17 +130,19 @@ class HierarchicalCompoundLoss(nn.Module):
         with torch.no_grad():
             probs = log_probs.exp()
 
+            mean_no = float(-log_p_no[targets == 0].mean()) if (targets == 0).any() else 0.0
+            mean_implicit = float(-log_p_implicit[targets == 1].mean()) if (targets == 1).any() else 0.0
+            mean_explicit = float(-log_p_explicit[targets == 2].mean()) if (targets == 2).any() else 0.0
+
             breakdown = {
                 "loss_total": float(loss.detach()),
-                "loss_no": float(
-                    -log_p_no[targets == 0].mean()
-                ) if (targets == 0).any() else 0.0,
-                "loss_implicit": float(
-                    -log_p_implicit[targets == 1].mean()
-                ) if (targets == 1).any() else 0.0,
-                "loss_explicit": float(
-                    -log_p_explicit[targets == 2].mean()
-                ) if (targets == 2).any() else 0.0,
+                "mean_nll_no": mean_no,
+                "mean_nll_implicit": mean_implicit,
+                "mean_nll_explicit": mean_explicit,
+                # Backward-compatible aliases
+                "loss_no": mean_no,
+                "loss_implicit": mean_implicit,
+                "loss_explicit": mean_explicit,
                 "prob_sum_error": float(
                     (probs.sum(dim=-1) - 1.0).abs().max()
                 ),

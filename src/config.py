@@ -28,6 +28,11 @@ class ModelConfig:
     # - 'static_h17': All transplant layers attend to the static representation H_17.
     context_mode: str = "layer_matched"   # 'layer_matched' | 'static_h17'
     
+    # Context Role IDs (Explicit Canonical Roles: 0:PAD, 1:TITLE, 2:DESC, 3:COMMENT, 4:SPECIAL, 5:HINT)
+    use_context_role_ids: bool = True
+    num_context_roles: int = 6
+    role_init_std: float = 0.02
+    
     # Experiment variants from blueprint
     use_prenorm: bool = False             # False = Exp A (Pure Projections), True = Exp B (Pre-LN)
     use_ffn_transplant: bool = False      # False = Projections only, True = Include FFN (Ablation 4)
@@ -70,7 +75,9 @@ class TrainingConfig:
     # Loss & Class Weighting
     use_class_weights: bool = True
     
+    # Precision, hardware & reproducibility
     fp16: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    deterministic: bool = False   # False = seeded reproducibility (high perf), True = bitwise cuDNN deterministic
     early_stopping_patience: int = 5
     num_workers: int = 2

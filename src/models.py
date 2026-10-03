@@ -115,9 +115,22 @@ def build_native_attention_masks(
 
 
 class PretrainedCrossAttentionLayer(nn.Module):
-    """Asymmetric Cross-Attention whose Q/K/V/O projections are borrowed
+    """Asymmetric RoPE Cross-Attention Layer.
 
-    directly from one pretrained ModernBERT attention block.
+    Projections (Wqkv, Wo) and optional MLP blocks are borrowed directly from pretrained
+    ModernBERT attention blocks via deepcopy to guarantee strict parameter isolation.
+
+    Architectural RoPE Specification (Asymmetric RoPE vs Native Symmetric RoPE):
+      - Native ModernBERT implements Symmetric RoPE in bidirectional self-attention:
+          Q' = RoPE(Q, pos),  K' = RoPE(K, pos)
+      - This architecture implements Asymmetric RoPE Cross-Attention:
+          Q remains UNROTATED (Position-Free Semantic Latents Z_0 in R^{K x D})
+          K is ROTATED (Tokens 1..L encoded with native ModernBERT Rotary Embeddings)
+      Rationale:
+        Z represents a fixed set of K learned abstract semantic query slots (e.g. Hate concept probes),
+        not sequential text tokens. Imposing positional rotation onto Q would inject spurious sequence
+        ordering into position-free semantic probes. Rotating K ensures the attention mechanism preserves
+        the relative token distances and syntax of the underlying context stream H.
     """
 
     def __init__(
@@ -142,7 +155,9 @@ class PretrainedCrossAttentionLayer(nn.Module):
         self.attn_norm = copy.deepcopy(pretrained_norm) if (use_prenorm and pretrained_norm is not None) else None
 
         self.mlp = copy.deepcopy(pretrained_mlp) if (use_ffn and pretrained_mlp is not None) else None
-        self.mlp_norm = copy.deepcopy(pretrained_mlp_norm) if (use_ffn and use_prenorm and pretrained_mlp_norm is not None) else None
+        # Faithful FFN transplant: ModernBERT MLP block strictly expects inputs normalized by mlp_norm.
+        # use_prenorm controls the Attention block (Exp A vs Exp B); the FFN block must always be faithfully normalized.
+        self.mlp_norm = copy.deepcopy(pretrained_mlp_norm) if (use_ffn and pretrained_mlp_norm is not None) else None
 
         self.rotary_emb = rotary_emb or getattr(pretrained_attn, "rotary_emb", None)
 
@@ -206,7 +221,9 @@ class PretrainedCrossAttentionLayer(nn.Module):
         z_out = z + self.Wo(attn_out)
 
         if self.use_ffn and self.mlp is not None:
-            z_mlp_in = self.mlp_norm(z_out) if (self.use_prenorm and self.mlp_norm is not None) else z_out
+            # Native ModernBERT FFN sub-block: H'' = H' + MLP(mlp_norm(H'))
+            # Pretrained MLP weights strictly expect mlp_norm normalized activations
+            z_mlp_in = self.mlp_norm(z_out) if self.mlp_norm is not None else z_out
             z_out = z_out + self.mlp(z_mlp_in)
 
         return z_out, attn_weights.mean(dim=1)
@@ -298,7 +315,10 @@ class TransplantedKLatentModel(nn.Module):
         freeze_encoder: bool = True,
         freeze_transplant: bool = True,
         probe_init_std: float = 0.02,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_context_role_ids: bool = True,
+        num_context_roles: int = 6,
+        role_init_std: float = 0.02
     ):
         super().__init__()
         self.model_name_or_path = model_name_or_path
@@ -307,6 +327,7 @@ class TransplantedKLatentModel(nn.Module):
         self.transplant_layers_count = transplant_layers_count
         self.context_mode = context_mode
         self.freeze_encoder = freeze_encoder
+        self.use_context_role_ids = use_context_role_ids
 
         # 1. Load mmBERT base model
         self.config = AutoConfig.from_pretrained(model_name_or_path)
@@ -318,6 +339,13 @@ class TransplantedKLatentModel(nn.Module):
 
         # 2. Trainable Class Queries Z_0 in R^[K x D]
         self.query_probes = nn.Parameter(torch.randn(num_query_slots, self.hidden_dim) * probe_init_std)
+
+        # 2b. Context Role Embeddings (0:PAD, 1:TITLE, 2:DESC, 3:COMMENT, 4:SPECIAL, 5:HINT)
+        if self.use_context_role_ids:
+            self.role_embeddings = nn.Embedding(num_context_roles, self.hidden_dim)
+            nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=role_init_std)
+        else:
+            self.role_embeddings = None
 
         # 3. Build Pretrained Cross-Attention Transplant Stack (Layers 18 to 22)
         self.transplant_layers = nn.ModuleList()
@@ -357,6 +385,9 @@ class TransplantedKLatentModel(nn.Module):
         self.query_probes.requires_grad = True
         for p in self.tree_head.parameters():
             p.requires_grad = True
+
+        # 6. Post-construction scientific assertions (Strict Parameter Isolation)
+        verify_parameter_isolation(self, freeze_encoder=freeze_encoder, freeze_transplant=freeze_transplant)
 
     def encode_context(
         self,
@@ -436,7 +467,8 @@ class TransplantedKLatentModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None
+        position_ids: Optional[torch.Tensor] = None,
+        role_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass with explicit encode_context and transplanted cross-attention."""
         B, L = input_ids.shape
@@ -466,6 +498,11 @@ class TransplantedKLatentModel(nn.Module):
                 f"layer_matched mode requires {required} hidden states, got {len(saved_hidden_states)}"
             )
 
+        # 2b. Compute Context Role Embedding if enabled and provided
+        role_emb = None
+        if self.use_context_role_ids and self.role_embeddings is not None and role_ids is not None:
+            role_emb = self.role_embeddings(role_ids.clamp(0, self.role_embeddings.num_embeddings - 1))
+
         # 3. Pass through Transplanted Cross-Attention Stack (Layers 18 to 22)
         for i, transplant_layer in enumerate(self.transplant_layers):
             if self.context_mode == "layer_matched":
@@ -474,6 +511,10 @@ class TransplantedKLatentModel(nn.Module):
             else:
                 # Static H_17 for all layers
                 h_ctx = saved_hidden_states[self.split_layer_idx]
+
+            # Inject role embedding into context stream for cross-attention
+            if role_emb is not None:
+                h_ctx = h_ctx + role_emb
 
             z, _ = transplant_layer(
                 z=z,
@@ -486,3 +527,138 @@ class TransplantedKLatentModel(nn.Module):
         logit_h, logit_f, compound_probs = self.tree_head(z)
 
         return logit_h, logit_f, compound_probs, z
+
+
+def verify_parameter_isolation(
+    model: nn.Module,
+    freeze_encoder: bool = True,
+    freeze_transplant: bool = True
+) -> None:
+    """Scientific verification asserting parameter isolation and weight borrowing fidelity.
+
+    Guarantees:
+      1. Gradient isolation: frozen parameter families never leak gradients (requires_grad=False).
+      2. Trainable invariants: query probes, classification head, and role embeddings have requires_grad=True.
+      3. Weight borrowing fidelity: W_transplant == W_source at initialization.
+      4. Memory decoupling: transplant weights are independent deepcopies (data_ptr mismatch).
+    """
+    backbone = getattr(model, "backbone", None)
+    transplant_layers = getattr(model, "transplant_layers", None)
+    split_layer_idx = getattr(model, "split_layer_idx", 17)
+
+    # 1. Gradient isolation check
+    if freeze_encoder and backbone is not None:
+        for name, p in backbone.named_parameters():
+            assert not p.requires_grad, f"Isolation failure: Backbone parameter '{name}' must be frozen!"
+
+    if freeze_transplant and transplant_layers is not None:
+        for name, p in transplant_layers.named_parameters():
+            assert not p.requires_grad, f"Isolation failure: Transplant parameter '{name}' must be frozen!"
+
+    # 2. Trainable invariants
+    query_probes = getattr(model, "query_probes", None)
+    if query_probes is not None:
+        assert query_probes.requires_grad, "Trainability failure: query_probes must have requires_grad=True!"
+
+    tree_head = getattr(model, "tree_head", None)
+    if tree_head is not None:
+        for name, p in tree_head.named_parameters():
+            assert p.requires_grad, f"Trainability failure: Classification head parameter '{name}' must be trainable!"
+
+    role_embeddings = getattr(model, "role_embeddings", None)
+    if role_embeddings is not None:
+        assert role_embeddings.weight.requires_grad, "Trainability failure: role_embeddings must have requires_grad=True!"
+
+    # 3. Weight borrowing fidelity check (W_copy == W_source) & Memory decoupling check
+    if backbone is not None and transplant_layers is not None:
+        layers = getattr(backbone, "layers", None) or getattr(backbone.encoder, "layers", None)
+        if layers is not None:
+            for i, transplant in enumerate(transplant_layers):
+                source_idx = split_layer_idx + i
+                if source_idx < len(layers):
+                    source = layers[source_idx].attn
+
+                    # Verify Wqkv weights
+                    assert torch.equal(transplant.Wqkv.weight, source.Wqkv.weight), (
+                        f"Weight borrowing fidelity violation at layer {i}: "
+                        f"transplant.Wqkv.weight != backbone layer {source_idx} attn.Wqkv.weight"
+                    )
+                    assert transplant.Wqkv.weight.data_ptr() != source.Wqkv.weight.data_ptr(), (
+                        f"Memory coupling violation at layer {i}: "
+                        f"transplant.Wqkv shares storage with backbone!"
+                    )
+                    if transplant.Wqkv.bias is not None and source.Wqkv.bias is not None:
+                        assert torch.equal(transplant.Wqkv.bias, source.Wqkv.bias), (
+                            f"Weight borrowing fidelity violation at layer {i}: Wqkv bias mismatch!"
+                        )
+
+                    # Verify Wo weights
+                    assert torch.equal(transplant.Wo.weight, source.Wo.weight), (
+                        f"Weight borrowing fidelity violation at layer {i}: "
+                        f"transplant.Wo.weight != backbone layer {source_idx} attn.Wo.weight"
+                    )
+                    assert transplant.Wo.weight.data_ptr() != source.Wo.weight.data_ptr(), (
+                        f"Memory coupling violation at layer {i}: "
+                        f"transplant.Wo shares storage with backbone!"
+                    )
+                    if transplant.Wo.bias is not None and source.Wo.bias is not None:
+                        assert torch.equal(transplant.Wo.bias, source.Wo.bias), (
+                            f"Weight borrowing fidelity violation at layer {i}: Wo bias mismatch!"
+                        )
+
+                    # Verify MLP and MLP Norm if FFN transplant is active (Ablation 4)
+                    if transplant.mlp is not None and getattr(layers[source_idx], "mlp", None) is not None:
+                        source_mlp = layers[source_idx].mlp
+                        for (p_name, tp), (_, sp) in zip(transplant.mlp.named_parameters(), source_mlp.named_parameters()):
+                            assert torch.equal(tp, sp), f"FFN transplant fidelity violation at layer {i}: {p_name}"
+                            assert tp.data_ptr() != sp.data_ptr(), f"FFN transplant coupling violation at layer {i}: {p_name}"
+
+                    if transplant.mlp_norm is not None and getattr(layers[source_idx], "mlp_norm", None) is not None:
+                        source_mlp_norm = layers[source_idx].mlp_norm
+                        for (p_name, tp), (_, sp) in zip(transplant.mlp_norm.named_parameters(), source_mlp_norm.named_parameters()):
+                            assert torch.equal(tp, sp), f"FFN norm transplant fidelity violation at layer {i}: {p_name}"
+                            assert tp.data_ptr() != sp.data_ptr(), f"FFN norm transplant coupling violation at layer {i}: {p_name}"
+
+
+
+def print_parameter_breakdown(model: nn.Module) -> None:
+    """Prints an explicit family-by-family audit of trainable vs frozen parameters."""
+    trainable_families: Dict[str, int] = {}
+    frozen_families: Dict[str, int] = {}
+
+    for name, p in model.named_parameters():
+        if "query_probes" in name:
+            family = "query_probes (K-latent vectors)"
+        elif "role_embeddings" in name:
+            family = "role_embeddings (context role IDs)"
+        elif "tree_head" in name:
+            family = "tree_head (hierarchical classifier)"
+        elif "transplant_layers" in name:
+            family = "transplant_layers (borrowed projections)"
+        elif "backbone" in name:
+            family = "backbone (context encoder)"
+        else:
+            family = name.split(".")[0]
+
+        target_dict = trainable_families if p.requires_grad else frozen_families
+        target_dict[family] = target_dict.get(family, 0) + p.numel()
+
+    print("\n" + "=" * 65)
+    print("🔒 PARAMETER ISOLATION PROTOCOL VERIFICATION")
+    print("=" * 65)
+    print("🟢 Trainable Parameter Families:")
+    for fam, cnt in sorted(trainable_families.items()):
+        print(f"   ✓ {fam:<42}: {cnt:>10,} params")
+
+    print("\n🧊 Frozen Parameter Families:")
+    for fam, cnt in sorted(frozen_families.items()):
+        print(f"   ❄️ {fam:<42}: {cnt:>10,} params")
+
+    total_train = sum(trainable_families.values())
+    total_frozen = sum(frozen_families.values())
+    total_all = total_train + total_frozen
+    pct = (total_train / total_all * 100) if total_all > 0 else 0.0
+    print("-" * 65)
+    print(f"Total: {total_train:,} Trainable | {total_frozen:,} Frozen ({pct:.2f}% active)")
+    print("=" * 65 + "\n")
+

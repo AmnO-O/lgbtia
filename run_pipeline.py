@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--unfreeze_encoder", action="store_true", help="Unfreeze backbone context encoder (default: frozen)")
     parser.add_argument("--unfreeze_transplant", action="store_true", help="Unfreeze transplanted projection matrices (default: frozen)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability in classification head")
+    parser.add_argument("--no_context_role_ids", action="store_true", help="Disable context role embeddings")
     
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=16)
@@ -61,7 +62,8 @@ def main():
             use_ffn_transplant=args.use_ffn,
             freeze_encoder=not args.unfreeze_encoder,
             freeze_transplant=not args.unfreeze_transplant,
-            dropout=args.dropout
+            dropout=args.dropout,
+            use_context_role_ids=not args.no_context_role_ids
         )
         t_cfg = TrainingConfig(
             output_dir=args.output_dir,

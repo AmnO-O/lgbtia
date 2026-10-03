@@ -6,12 +6,13 @@ import argparse
 from typing import List, Dict, Optional
 
 import torch
+from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer
 
 from src.config import ModelConfig
-from src.data import clean_multilingual_text, IDX2HATE
+from src.data import clean_multilingual_text, IDX2HATE, HateSpeechDataset
 from src.models import TransplantedKLatentModel
 
 
@@ -41,17 +42,14 @@ class HateSpeechPredictor:
             use_ffn=self.model_cfg.use_ffn_transplant,
             freeze_encoder=False,
             freeze_transplant=False,
-            dropout=0.0
+            dropout=0.0,
+            use_context_role_ids=getattr(self.model_cfg, 'use_context_role_ids', True),
+            num_context_roles=getattr(self.model_cfg, 'num_context_roles', 6),
+            role_init_std=getattr(self.model_cfg, 'role_init_std', 0.02)
         )
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
-
-    def format_input(self, comment: str, title: str = "", description: str = "") -> str:
-        c = clean_multilingual_text(comment)
-        t = clean_multilingual_text(title)
-        d = clean_multilingual_text(description)
-        return f"Comment: {c} [SEP] Video: {t} [SEP] Description: {d}"
 
     @torch.no_grad()
     def predict_batch(
@@ -65,26 +63,32 @@ class HateSpeechPredictor:
         titles = titles or [""] * len(comments)
         descriptions = descriptions or [""] * len(comments)
 
-        formatted_texts = [
-            self.format_input(c, t, d)
-            for c, t, d in zip(comments, titles, descriptions)
-        ]
+        df_input = pd.DataFrame({
+            "clean_comment": [clean_multilingual_text(c) for c in comments],
+            "clean_title": [clean_multilingual_text(t) for t in titles],
+            "clean_desc": [clean_multilingual_text(d) for d in descriptions],
+        })
+
+        dataset = HateSpeechDataset(
+            df=df_input,
+            tokenizer=self.tokenizer,
+            max_length=max_length
+        )
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         all_preds = []
         all_probs = []
 
-        sep = self.tokenizer.sep_token or '</s>'
-        for i in range(0, len(formatted_texts), batch_size):
-            chunk = formatted_texts[i:i + batch_size]
-            encoded = self.tokenizer(
-                [t.replace('[SEP]', sep) for t in chunk],
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors='pt'
-            ).to(self.device)
+        for batch in loader:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            role_ids = batch["role_ids"].to(self.device)
 
-            _, _, compound_probs, _ = self.model(encoded['input_ids'], encoded['attention_mask'])
+            _, _, compound_probs, _ = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                role_ids=role_ids
+            )
             probs = compound_probs.cpu().numpy()
             preds = np.argmax(probs, axis=-1)
 

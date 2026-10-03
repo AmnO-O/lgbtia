@@ -3,6 +3,7 @@
 
 import os
 import time
+import math
 import argparse
 from typing import Dict, Tuple, Optional, Any
 
@@ -14,6 +15,7 @@ import pandas as pd
 import numpy as np
 import random
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report
 
 from src.config import ModelConfig, TrainingConfig
 from src.data import (
@@ -24,7 +26,11 @@ from src.data import (
     HATE2IDX,
     IDX2HATE
 )
-from src.models import TransplantedKLatentModel
+from src.models import (
+    TransplantedKLatentModel,
+    print_parameter_breakdown,
+    verify_parameter_isolation
+)
 from src.losses import HierarchicalCompoundLoss
 from src.metrics import compute_task_b_metrics, evaluate_task_b_by_language
 
@@ -78,17 +84,23 @@ def evaluate_epoch(
     """Runs validation evaluation and computes Macro F1 and per-language breakdowns."""
     model.eval()
     val_loss_sum = 0.0
+    total_val_samples = 0
     all_preds = []
     all_labels = []
 
     for batch in val_loader:
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
+        role_ids = batch.get('role_ids', None)
+        if role_ids is not None:
+            role_ids = role_ids.to(device)
         labels = batch['label'].to(device)
+        bs = labels.size(0)
 
-        logit_h, logit_f, compound_probs, _ = model(input_ids, attention_mask)
+        logit_h, logit_f, compound_probs, _ = model(input_ids, attention_mask, role_ids=role_ids)
         loss, _ = loss_fn(logit_h, logit_f, labels)
-        val_loss_sum += loss.item()
+        val_loss_sum += loss.item() * bs
+        total_val_samples += bs
 
         preds = torch.argmax(compound_probs, dim=-1).cpu().numpy().flatten()
         all_preds.extend(preds)
@@ -96,10 +108,18 @@ def evaluate_epoch(
 
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
-    val_loss = val_loss_sum / max(1, len(val_loader))
+    val_loss = val_loss_sum / max(1, total_val_samples)
 
     metrics = compute_task_b_metrics(all_labels, all_preds)
     metrics['val_loss'] = val_loss
+    metrics['report'] = classification_report(
+        all_labels,
+        all_preds,
+        labels=[0, 1, 2],
+        target_names=['no', 'yes_implicit', 'yes_explicit'],
+        digits=4,
+        zero_division=0
+    )
 
     breakdown_df = evaluate_task_b_by_language(val_df, all_preds)
     return metrics, breakdown_df
@@ -118,12 +138,26 @@ def train_task_b_model(
     device = torch.device(train_cfg.device)
     print(f"=== Task B: K-Latent Transplant mmBERT (K={model_cfg.num_query_slots}) on {device} ===")
 
-    # Set all random seeds for reproducibility
+    # Set random seeds for reproducibility (distinguishing seeded vs bitwise deterministic)
     random.seed(train_cfg.seed)
     np.random.seed(train_cfg.seed)
     torch.manual_seed(train_cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(train_cfg.seed)
+
+    if train_cfg.deterministic:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            print("🔒 Strict bitwise deterministic training enabled (cuDNN deterministic, benchmark disabled).")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not enable strict deterministic algorithms ({e}).")
+    else:
+        # Default seeded reproducibility: fast cuDNN benchmarking allowed
+        torch.backends.cudnn.benchmark = True
+        print("🌱 Seeded reproducibility enabled (identical data shuffle, weights init; fast non-deterministic GPU kernels).")
 
     # 1. Load Data
     if df_raw is None:
@@ -151,17 +185,27 @@ def train_task_b_model(
     else:
         class_weights_tensor = None
 
-    # 3. Tokenizer & DataLoaders
+    # 3. Tokenizer & DataLoaders with deterministic worker initialization
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.model_name_or_path)
     train_dataset = HateSpeechDataset(train_df, tokenizer, max_length=train_cfg.max_length)
-    val_dataset = HateSpeechDataset(val_df, tokenizer, max_length=train_cfg.max_length, is_training=False)
+    val_dataset = HateSpeechDataset(val_df, tokenizer, max_length=train_cfg.max_length)
+
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % (2**32)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    g = torch.Generator()
+    g.manual_seed(train_cfg.seed)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg.batch_size,
         shuffle=True,
         num_workers=train_cfg.num_workers,
-        pin_memory=(train_cfg.device == 'cuda')
+        pin_memory=(train_cfg.device == 'cuda'),
+        worker_init_fn=seed_worker,
+        generator=g
     )
     val_loader = DataLoader(
         val_dataset,
@@ -183,20 +227,22 @@ def train_task_b_model(
         freeze_encoder=model_cfg.freeze_encoder,
         freeze_transplant=model_cfg.freeze_transplant,
         probe_init_std=model_cfg.probe_init_std,
-        dropout=model_cfg.dropout
+        dropout=model_cfg.dropout,
+        use_context_role_ids=model_cfg.use_context_role_ids,
+        num_context_roles=model_cfg.num_context_roles,
+        role_init_std=model_cfg.role_init_std
     ).to(device)
 
     loss_fn = HierarchicalCompoundLoss(
         class_weights=class_weights_tensor
     ).to(device)
 
-    # Count trainable vs frozen parameters
-    trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f"Parameters: {trainable_p:,} Trainable | {frozen_p:,} Frozen (Strict Isolation Protocol)")
+    # Explicit Parameter Isolation & Family Breakdown Audit
+    print_parameter_breakdown(model)
 
     # 5. Optimizer & Scheduler
-    total_steps = (len(train_loader) // train_cfg.gradient_accumulation_steps) * train_cfg.epochs
+    updates_per_epoch = math.ceil(len(train_loader) / train_cfg.gradient_accumulation_steps)
+    total_steps = updates_per_epoch * train_cfg.epochs
     optimizer, scheduler = create_optimizer_and_scheduler(model, train_cfg, total_steps)
 
     scaler = torch.amp.GradScaler('cuda', enabled=train_cfg.fp16 and train_cfg.device == 'cuda')
@@ -204,23 +250,37 @@ def train_task_b_model(
     best_macro_f1 = -1.0
     patience_counter = 0
     best_metrics = {}
+    best_breakdown_df = pd.DataFrame()
+    history = []
 
     for epoch in range(train_cfg.epochs):
         t0 = time.time()
         model.train()
-        train_loss = 0.0
-        valid_steps = 0
+        train_loss_sum = 0.0
+        total_train_samples = 0
         optimizer.zero_grad()
+
+        total_batches = len(train_loader)
+        accum_steps = train_cfg.gradient_accumulation_steps
 
         for step, batch in enumerate(train_loader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
+            role_ids = batch.get('role_ids', None)
+            if role_ids is not None:
+                role_ids = role_ids.to(device)
             labels = batch['label'].to(device)
+            bs = labels.size(0)
+
+            # Determine actual number of microbatches in this accumulation group
+            group_start = (step // accum_steps) * accum_steps
+            group_end = min(group_start + accum_steps, total_batches)
+            current_accum_steps = group_end - group_start
 
             with torch.amp.autocast('cuda', enabled=train_cfg.fp16 and train_cfg.device == 'cuda'):
-                logit_h, logit_f, _, _ = model(input_ids, attention_mask)
-                loss, _ = loss_fn(logit_h, logit_f, labels)
-                loss = loss / train_cfg.gradient_accumulation_steps
+                logit_h, logit_f, _, _ = model(input_ids, attention_mask, role_ids=role_ids)
+                raw_loss, _ = loss_fn(logit_h, logit_f, labels)
+                loss = raw_loss / current_accum_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"⚠️ Warning: NaN/Inf loss encountered at step {step}. Skipping step and clearing gradients.")
@@ -229,7 +289,8 @@ def train_task_b_model(
 
             scaler.scale(loss).backward()
 
-            if (step + 1) % train_cfg.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
+            is_accum_step = ((step + 1) % accum_steps == 0) or ((step + 1) == total_batches)
+            if is_accum_step:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -242,10 +303,10 @@ def train_task_b_model(
                 if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
                     optimizer.zero_grad()
 
-            train_loss += loss.item() * train_cfg.gradient_accumulation_steps
-            valid_steps += 1
+            train_loss_sum += raw_loss.item() * bs
+            total_train_samples += bs
 
-        train_loss = train_loss / max(1, valid_steps)
+        train_loss = train_loss_sum / max(1, total_train_samples)
 
         # Validation
         val_metrics, breakdown_df = evaluate_epoch(model, val_loader, val_df, loss_fn, device)
@@ -259,10 +320,22 @@ def train_task_b_model(
             f"Time: {elapsed:.1f}s"
         )
 
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_metrics['val_loss'],
+            'val_macro_f1': val_metrics['macro_f1'],
+            'val_accuracy': val_metrics['accuracy'],
+            'f1_no': val_metrics.get('f1_no', 0.0),
+            'f1_implicit': val_metrics.get('f1_yes_implicit', 0.0),
+            'f1_explicit': val_metrics.get('f1_yes_explicit', 0.0)
+        })
+
         curr_macro_f1 = val_metrics['macro_f1']
         if curr_macro_f1 > best_macro_f1:
             best_macro_f1 = curr_macro_f1
             best_metrics = val_metrics
+            best_breakdown_df = breakdown_df
             patience_counter = 0
 
             checkpoint_path = os.path.join(train_cfg.output_dir, "best_task_b_model.pt")
@@ -281,7 +354,15 @@ def train_task_b_model(
                 print(f"🛑 Early stopping triggered after {epoch+1} epochs.")
                 break
 
-    return model, best_metrics
+    results = {
+        'best_val_macro_f1': best_macro_f1,
+        'best_metrics': best_metrics,
+        'final_metrics': best_metrics,
+        'language_breakdown': best_breakdown_df,
+        'history': history,
+        **best_metrics
+    }
+    return model, results
 
 
 if __name__ == "__main__":
@@ -310,7 +391,9 @@ if __name__ == "__main__":
     parser.add_argument("--val_size", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--deterministic", action="store_true", help="Enable strict bitwise deterministic training (cuDNN deterministic)")
     parser.add_argument("--no_class_weights", action="store_true")
+    parser.add_argument("--no_context_role_ids", action="store_true", help="Disable context role embeddings")
     parser.add_argument("--output_dir", type=str, default="./outputs_task_b")
     args = parser.parse_args()
 
@@ -325,7 +408,8 @@ if __name__ == "__main__":
         use_ffn_transplant=args.use_ffn,
         freeze_encoder=not args.unfreeze_encoder,
         freeze_transplant=not args.unfreeze_transplant,
-        dropout=args.dropout
+        dropout=args.dropout,
+        use_context_role_ids=not args.no_context_role_ids
     )
     t_cfg = TrainingConfig(
         output_dir=args.output_dir,
@@ -341,6 +425,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         use_class_weights=not args.no_class_weights,
+        deterministic=args.deterministic,
         num_workers=args.num_workers
     )
 

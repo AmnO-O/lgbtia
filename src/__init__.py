@@ -6,7 +6,20 @@ from src.losses import HierarchicalCompoundLoss
 from src.metrics import compute_task_b_metrics, evaluate_task_b_by_language
 
 try:
-    from src.data import HateSpeechDataset, load_dataset_files, preprocess_task_b_dataframe, HATE2IDX, IDX2HATE
+    from src.data import (
+        HateSpeechDataset,
+        load_dataset_files,
+        preprocess_task_b_dataframe,
+        HATE2IDX,
+        IDX2HATE,
+        ROLE_PAD,
+        ROLE_TITLE,
+        ROLE_DESC,
+        ROLE_COMMENT,
+        ROLE_SPECIAL,
+        ROLE_HINT,
+        NUM_ROLES
+    )
 except ImportError:
     pass
 
